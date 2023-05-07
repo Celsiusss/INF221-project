@@ -1,18 +1,16 @@
-name:                monomer-starter
-version:             0.1.0.0
+name: hs-monitor
+version: 0.1.0.0
 #synopsis:
 #description:
-homepage:            https://github.com/githubuser/monomer-starter#readme
-license:             BSD3
-author:              Author name here
-maintainer:          example@example.com
-copyright:           2021 Author name here
+license: BSD3
+author: Daniel Liland
 #category:
 extra-source-files:
-- README.md
+  - README.md
 
 default-extensions:
-- OverloadedStrings
+  - OverloadedStrings
+  - ImportQualifiedPost
 
 dependencies:
   - base >= 4.7 && < 5
@@ -22,11 +20,17 @@ dependencies:
   - text
   - text-show
   - directory
+  - typed-process
+  - MissingH
+  - bytestring
+  - strict
+  - async
+  - parallel-io
 
 executables:
-  app:
-    source-dirs:      src
-    main:             Main.hs
+  hs-monitor:
+    source-dirs: src
+    main: Main.hs
     ghc-options:
-    - -fwarn-incomplete-patterns
-    - -threaded
+      - -fwarn-incomplete-patterns
+      - -threaded

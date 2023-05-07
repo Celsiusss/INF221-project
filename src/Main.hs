@@ -1,57 +1,30 @@
+{-# LANGUAGE DuplicateRecordFields #-}
+{-# LANGUAGE ImportQualifiedPost #-}
 {-# LANGUAGE OverloadedStrings #-}
-{-# LANGUAGE TemplateHaskell #-}
+{-# OPTIONS_GHC -Wno-unrecognised-pragmas #-}
+
+{-# HLINT ignore "Eta reduce" #-}
+{-# HLINT ignore "Use map once" #-}
 
 module Main where
 
+import Control.Concurrent (threadDelay)
+import Control.Exception
 import Control.Lens
+import Control.Monad (forever)
+import Data.Char (isSpace)
+import Data.Default (def)
+import Data.List (find)
 import Data.Maybe
-import Data.Text (Text, pack)
-import GHC.IO.FD (openFile)
 import Monomer
-import System.Directory
+import System.Directory (listDirectory)
+import System.IO.Strict qualified as Strict (readFile)
+import Text.Printf (printf)
 import Text.Read (readMaybe)
 import TextShow
-
-data Process = Process
-  { _pid :: Int,
-    _name :: String,
-    _memory :: Int
-  }
-  deriving (Eq, Show)
-
-data AppModel = AppModel
-  { _processes :: [Process]
-  }
-  deriving (Eq, Show)
-
-data AppEvent
-  = AppInit
-  | AppUpdate [Process]
-  | AppIncrease
-  | AppReadProc
-  deriving (Eq, Show)
-
-makeLenses 'AppModel
-makeLenses 'Process
-
-buildUI ::
-  WidgetEnv AppModel AppEvent ->
-  AppModel ->
-  WidgetNode AppModel AppEvent
-buildUI wenv model = widgetTree
-  where
-    widgetTree =
-      vscroll $
-        vstack
-          [ label "Hello world",
-            spacer,
-            hstack [],
-            hgrid [label "PID", label "Name"],
-            vgrid $
-              map (\x -> hgrid [label $ showt $ x ^. pid, label $ pack $ x ^. name]) $
-                model ^. processes
-          ]
-          `styleBasic` [padding 10]
+import Types
+import UI (buildUI)
+import Utils
 
 handleEvent ::
   WidgetEnv AppModel AppEvent ->
@@ -60,20 +33,93 @@ handleEvent ::
   AppEvent ->
   [AppEventResponse AppModel AppEvent]
 handleEvent wenv node model evt = case evt of
-  AppInit -> [Task $ AppUpdate <$> readProcess]
-  AppReadProc -> [Task $ AppUpdate <$> readProcess]
-  AppUpdate s -> [Model $ model & processes .~ s]
+  AppInit -> [Producer refresher]
+  AppReadProc -> [Task $ AppTick <$> doProcessUpdate model]
+  AppUpdate ps -> [Model $ model & processes .~ ps]
   AppIncrease -> [Model model]
+  AppTick (ps, t, (mTotal, mFree)) ->
+    [ Model $
+        model
+          & processes .~ ps
+          & previousCpuTimeTotal .~ (model ^. cpuTimeTotal)
+          & cpuTimeTotal .~ t
+          & cpuHistory .~ newCpuHist
+          & memTotal .~ mTotal
+          & memFree .~ mFree
+          & memHistory .~ newMemHist
+    ]
+    where
+      totalCpuPerc = (sum . map (^. cpuPerc)) (model ^. processes)
+      newCpuHist = updateHist totalCpuPerc $ model ^. cpuHistory
+      memPerc = 100 * (fromIntegral (model ^. memTotal - model ^. memFree) :: Double) / fromIntegral (model ^. memTotal)
+      newMemHist = updateHist memPerc $ model ^. memHistory
+  AppSortBy ordering ->
+    [ Model $
+        if currentOrdering == ordering
+          then model & orderAscending .~ not (model ^. orderAscending)
+          else model & orderBy .~ ordering
+    ]
+    where
+      currentOrdering = model ^. orderBy
+      currentIsAscending = model ^. orderAscending
 
-readProcess :: IO [Process]
-readProcess = do
+refresher :: (AppEvent -> IO ()) -> IO ()
+refresher sendMsg = forever $ do
+  sendMsg AppReadProc
+  threadDelay (1000 * 1000)
+
+readFileMaybe :: FilePath -> IO (Maybe String)
+readFileMaybe path = either (const Nothing) Just <$> (try (Strict.readFile path) :: IO (Either IOException String))
+
+readProcesses :: IO [Process]
+readProcesses = do
   names <- listDirectory "/proc"
-  let pids = mapMaybe readMaybe names
-  names <- mapM (\p -> readFile $ "/proc/" ++ show p ++ "/comm") pids
-  stats <- mapM (\p -> readFile $ "/proc/" ++ show p ++ "/stat") pids
-  let stats' = map words stats -- todo
-  let processes = zipWith (\p name -> Process p name 0) pids names
-  return processes
+  let pids = mapMaybe readMaybe names :: [Int]
+  owners <- getPIDOwners pids
+  stats <- mapM (\p -> readFileMaybe $ "/proc/" ++ show p ++ "/stat") pids
+  ctr <- getSystemClockTick
+  let processes = map (parseProcess . parseStat) (catMaybes stats)
+  let withOwners = zipWith (\s p -> p & owner .~ s) owners processes
+  return withOwners
+
+readMemory :: IO (Int, Int)
+readMemory = do
+  out <- readFile "/proc/meminfo"
+  let list = map (map (takeWhile (/= ':')) . filter (\s -> s /= "" && s /= "kB") . words) $ lines out
+
+  let mappedList = map (\[a, b] -> (a, read b :: Int)) list
+  let findVal s = (fmap snd . find (\(name, value) -> name == s)) mappedList
+
+  let total = findVal "MemTotal"
+  let free = findVal "MemAvailable"
+
+  return (fromJust total, fromJust free)
+
+readTotalCpuTime :: IO Integer
+readTotalCpuTime = parseCpuStat <$> readFile "/proc/stat"
+
+-- takes previous processes as input, and return a tuple of new processes, prev cpu times and total cpu time
+doProcessUpdate :: AppModel -> IO ([Process], Integer, (Int, Int))
+doProcessUpdate model = do
+  let previousProcesses = model ^. processes
+  processes <- readProcesses
+  totalCpuTime <- readTotalCpuTime
+
+  -- map cpuTime from previousProcesses into prevCpuTime on newProcesses
+  let newProcesses =
+        map (applyPreviousCpuTimes previousProcesses . calculateCpuTimes totalCpuTime (model ^. previousCpuTimeTotal)) $
+          map (applyPreviousCpuTimes previousProcesses) processes
+
+  memory <- readMemory
+  return (newProcesses, totalCpuTime, memory)
+  where
+    applyPreviousCpuTimes :: [Process] -> Process -> Process
+    applyPreviousCpuTimes previousProcesses process =
+      process & prevCpuTime .~ maybe 0 (^. cpuTime) (find (\p' -> (p' ^. pid) == (process ^. pid)) previousProcesses)
+
+    calculateCpuTimes :: Integer -> Integer -> Process -> Process
+    calculateCpuTimes totalCpuTime previousTotalCpuTime process =
+      process & cpuPerc .~ (2 * 100 * (fromInteger (process ^. cpuTime - process ^. prevCpuTime) :: Double) / fromInteger (totalCpuTime - previousTotalCpuTime))
 
 main :: IO ()
 main = do
@@ -84,6 +130,6 @@ main = do
         appWindowIcon "./assets/images/icon.png",
         appTheme lightTheme,
         appFontDef "Regular" "./assets/fonts/Roboto-Regular.ttf",
-        appInitEvent AppReadProc
+        appInitEvent AppInit
       ]
-    model = AppModel []
+    model = def
