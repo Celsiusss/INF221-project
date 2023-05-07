@@ -93,6 +93,7 @@ readMemory = do
   let total = findVal "MemTotal"
   let free = findVal "MemAvailable"
 
+  -- using fromJust since we expect MemTotal and MemAvailable to exist.
   return (fromJust total, fromJust free)
 
 readTotalCpuTime :: IO Integer
@@ -107,7 +108,7 @@ doProcessUpdate model = do
 
   -- map cpuTime from previousProcesses into prevCpuTime on newProcesses
   let newProcesses =
-        map (applyPreviousCpuTimes previousProcesses . calculateCpuTimes totalCpuTime (model ^. previousCpuTimeTotal)) $
+        map (calculateCpuTimes totalCpuTime (model ^. previousCpuTimeTotal)) $
           map (applyPreviousCpuTimes previousProcesses) processes
 
   memory <- readMemory
